@@ -17,7 +17,7 @@ struct erofs_compressor {
 	u32 default_dictsize;
 	u32 max_dictsize;
 
-	int (*init)(struct erofs_compress *c);
+	int (*init)(struct erofs_compress *c, bool print_warning);
 	int (*exit)(struct erofs_compress *c);
 	int (*setlevel)(struct erofs_compress *c, int compression_level);
 	int (*setdictsize)(struct erofs_compress *c, u32 dict_size);
@@ -60,7 +60,8 @@ int erofs_compress_destsize(const struct erofs_compress *c,
 			    void *dst, unsigned int dstsize);
 
 int erofs_compressor_init(struct erofs_sb_info *sbi, struct erofs_compress *c,
-			  char *alg_name, int compression_level, u32 dict_size);
+			  char *alg_name, int compression_level, u32 dict_size,
+			  bool print_warning);
 int erofs_compressor_exit(struct erofs_compress *c);
 
 #endif

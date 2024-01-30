@@ -30,7 +30,7 @@ static int compressor_lz4_exit(struct erofs_compress *c)
 	return 0;
 }
 
-static int compressor_lz4_init(struct erofs_compress *c)
+static int compressor_lz4_init(struct erofs_compress *c, bool print_warning)
 {
 	c->sbi->lz4_max_distance = LZ4_DISTANCE_MAX;
 	return 0;

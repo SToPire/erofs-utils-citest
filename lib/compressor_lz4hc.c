@@ -37,7 +37,7 @@ static int compressor_lz4hc_exit(struct erofs_compress *c)
 	return 0;
 }
 
-static int compressor_lz4hc_init(struct erofs_compress *c)
+static int compressor_lz4hc_init(struct erofs_compress *c, bool print_warning)
 {
 	c->private_data = LZ4_createStreamHC();
 	if (!c->private_data)

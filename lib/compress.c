@@ -1213,7 +1213,8 @@ int z_erofs_compress_init(struct erofs_sb_info *sbi, struct erofs_buffer_head *s
 
 		ret = erofs_compressor_init(sbi, c, cfg.c_compr_opts[i].alg,
 					    cfg.c_compr_opts[i].level,
-					    cfg.c_compr_opts[i].dict_size);
+					    cfg.c_compr_opts[i].dict_size,
+					    true);
 		if (ret)
 			return ret;
 

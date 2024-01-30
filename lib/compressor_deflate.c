@@ -34,7 +34,7 @@ static int compressor_deflate_exit(struct erofs_compress *c)
 	return 0;
 }
 
-static int compressor_deflate_init(struct erofs_compress *c)
+static int compressor_deflate_init(struct erofs_compress *c, bool print_warning)
 {
 	if (c->private_data) {
 		kite_deflate_end(c->private_data);
@@ -44,9 +44,11 @@ static int compressor_deflate_init(struct erofs_compress *c)
 	if (IS_ERR_VALUE(c->private_data))
 		return PTR_ERR(c->private_data);
 
-	erofs_warn("EXPERIMENTAL DEFLATE algorithm in use. Use at your own risk!");
-	erofs_warn("*Carefully* check filesystem data correctness to avoid corruption!");
-	erofs_warn("Please send a report to <linux-erofs@lists.ozlabs.org> if something is wrong.");
+	if (print_warning) {
+		erofs_warn("EXPERIMENTAL DEFLATE algorithm in use. Use at your own risk!");
+		erofs_warn("*Carefully* check filesystem data correctness to avoid corruption!");
+		erofs_warn("Please send a report to <linux-erofs@lists.ozlabs.org> if something is wrong.");
+	}
 	return 0;
 }
 

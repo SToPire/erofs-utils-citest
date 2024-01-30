@@ -78,7 +78,8 @@ int erofs_compress_destsize(const struct erofs_compress *c,
 }
 
 int erofs_compressor_init(struct erofs_sb_info *sbi, struct erofs_compress *c,
-			  char *alg_name, int compression_level, u32 dict_size)
+			  char *alg_name, int compression_level, u32 dict_size,
+			  bool print_warning)
 {
 	int ret, i;
 
@@ -126,7 +127,7 @@ int erofs_compressor_init(struct erofs_sb_info *sbi, struct erofs_compress *c,
 			return -EINVAL;
 		}
 
-		ret = erofs_algs[i].c->init(c);
+		ret = erofs_algs[i].c->init(c, print_warning);
 		if (ret)
 			return ret;
 
