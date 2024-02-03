@@ -90,6 +90,14 @@ static inline void list_splice_tail(struct list_head *list,
 		__list_splice(list, head->prev, head);
 }
 
+static inline void list_replace(struct list_head *old, struct list_head *new)
+{
+	new->next = old->next;
+	new->next->prev = new;
+	new->prev = old->prev;
+	new->prev->next = new;
+}
+
 #define list_entry(ptr, type, member) container_of(ptr, type, member)
 
 #define list_first_entry(ptr, type, member)                                    \

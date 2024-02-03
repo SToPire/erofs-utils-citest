@@ -55,5 +55,5 @@ liberofs_la_SOURCES += compressor_libdeflate.c
 endif
 if ENABLE_EROFS_MT
 liberofs_la_CFLAGS += -lpthread
-liberofs_la_SOURCES += workqueue.c
+liberofs_la_SOURCES += workqueue.c queue.c
 endif

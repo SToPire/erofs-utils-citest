@@ -250,6 +250,9 @@ struct erofs_inode {
 #ifdef WITH_ANDROID
 	uint64_t capabilities;
 #endif
+#ifdef EROFS_MT_ENABLED
+	struct erofs_compress_file* cfile;
+#endif
 };
 
 static inline erofs_off_t erofs_iloc(struct erofs_inode *inode)

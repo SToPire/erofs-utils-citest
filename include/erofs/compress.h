@@ -17,6 +17,23 @@ extern "C"
 #define EROFS_CONFIG_COMPR_MAX_SZ           (4000 * 1024)
 #define EROFS_COMPR_QUEUE_SZ (EROFS_CONFIG_COMPR_MAX_SZ * 2)
 
+#ifdef EROFS_MT_ENABLED
+struct erofs_compress_file {
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	int total;
+	int nfini;
+
+	struct z_erofs_write_index_ctx *ictx;
+	struct erofs_compress_work *head;
+	int fd;
+
+	struct erofs_compress_file *next;
+};
+
+int z_erofs_mt_reap(struct erofs_compress_file *cfile);
+#endif
+
 void z_erofs_drop_inline_pcluster(struct erofs_inode *inode);
 int erofs_write_compressed_file(struct erofs_inode *inode, int fd);
 
