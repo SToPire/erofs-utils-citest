@@ -3,9 +3,7 @@ name: erofs-utils CI
 on:
   push:
     branches:
-      - master
-      - dev
-      - experimental
+      - '**'
   workflow_dispatch:
 
 jobs:
