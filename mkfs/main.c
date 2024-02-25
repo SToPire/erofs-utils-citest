@@ -73,6 +73,9 @@ static struct option long_options[] = {
 	{"gzip", no_argument, NULL, 517},
 #endif
 	{"offset", required_argument, NULL, 518},
+#ifdef EROFS_MT_ENABLED
+	{"workers", required_argument, NULL, 519},
+#endif
 	{0, 0, 0, 0},
 };
 
@@ -175,6 +178,9 @@ static void usage(int argc, char **argv)
 		" --product-out=X       X=product_out directory\n"
 		" --fs-config-file=X    X=fs_config file\n"
 		" --block-list-file=X   X=block_list file\n"
+#endif
+#ifdef EROFS_MT_ENABLED
+		" --workers=#            set the number of worker threads to # (default=1)\n"
 #endif
 		);
 }
@@ -403,6 +409,13 @@ static void erofs_rebuild_cleanup(void)
 	}
 	rebuild_src_count = 0;
 }
+
+#ifdef EROFS_MT_ENABLED
+static u32 mkfs_max_worker_num() {
+	u32 ncpu = erofs_get_available_processors();
+	return ncpu ? ncpu : 16;
+}
+#endif
 
 static int mkfs_parse_options_cfg(int argc, char *argv[])
 {
@@ -642,6 +655,21 @@ static int mkfs_parse_options_cfg(int argc, char *argv[])
 				return -EINVAL;
 			}
 			break;
+#ifdef EROFS_MT_ENABLED
+		case 519:
+			cfg.c_mt_workers = strtoul(optarg, &endptr, 0);
+			if (errno || *endptr != '\0') {
+				erofs_err("invalid worker number %s", optarg);
+				return -EINVAL;
+			}
+			if (cfg.c_mt_workers > mkfs_max_worker_num()) {
+				erofs_warn(
+					"worker number %s is too large, setting to %ud",
+					optarg, mkfs_max_worker_num());
+				cfg.c_mt_workers = mkfs_max_worker_num();
+			}
+			break;
+#endif
 		case 'V':
 			version();
 			exit(0);
@@ -784,6 +812,16 @@ static int mkfs_parse_options_cfg(int argc, char *argv[])
 		}
 		cfg.c_pclusterblks_packed = pclustersize_packed >> sbi.blkszbits;
 	}
+
+#ifdef EROFS_MT_ENABLED
+	if (cfg.c_mt_workers > 1 &&
+	    (cfg.c_dedupe || cfg.c_fragments || cfg.c_ztailpacking)) {
+		cfg.c_mt_workers = 1;
+		erofs_warn("Please note that dedupe/fragments/ztailpacking"
+			   "is NOT supported in multi-threaded mode now, using worker=1.");
+	}
+#endif
+
 	return 0;
 }
 
