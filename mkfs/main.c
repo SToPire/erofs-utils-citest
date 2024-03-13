@@ -843,6 +843,15 @@ static int mkfs_parse_options_cfg(int argc, char *argv[])
 		cfg.c_pclusterblks_packed = pclustersize_packed >> sbi.blkszbits;
 	}
 
+#ifdef EROFS_MT_ENABLED
+	if (cfg.c_mt_workers > 1 &&
+	    (cfg.c_dedupe || cfg.c_fragments || cfg.c_ztailpacking)) {
+		cfg.c_mt_workers = 1;
+		erofs_warn("Please note that dedupe/fragments/ztailpacking"
+			   "is NOT supported in multi-threaded mode now, using worker=1.");
+	}
+#endif
+
 	return 0;
 }
 
