@@ -1,0 +1,91 @@
+name: erofs-utils CI
+
+on:
+  push:
+    branches:
+      - '*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout erofs-utils
+        uses: actions/checkout@v4
+        with:
+          path: 'erofs-utils'
+
+      - name: autogen erofs-utils
+        working-directory: ./erofs-utils/
+        run: ./autogen.sh
+
+      - name: configure erofs-utils
+        working-directory: ./erofs-utils/
+        run: ./configure --enable-debug
+          --prefix=${{ github.workspace }}/erofs-utils-install/ --enable-multithreading
+
+      - name: make and install erofs-utils
+        working-directory: ./erofs-utils/
+        run: |
+          make
+          make install
+
+      - name: tar erofs-utils binaries
+        run: tar -cvf erofs-utils-binaries.tar -C ${{ github.workspace }}/erofs-utils-install/bin .
+
+      - name: upload erofs-utils binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: erofs-utils-binaries
+          path: erofs-utils-binaries.tar
+          overwrite: true
+
+  mkfs-correctness:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        algorithm: ['', '-zlz4', '-zlz4hc', '-zdeflate']
+        dedupe: ['', '-Ededupe']
+        fragments: ['', '-Efragments', '-Eall-fragments']
+        ztailpacking: ['', '-Eztailpacking']
+        worker: ['--workers=1', '--workers=2', '--workers=4', '--workers=8']
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: cache Linux-src
+        id: cache-linux-src
+        uses: actions/cache@v4
+        with:
+          path: 'Linux-src'
+          key: Linux-src-v6.7
+
+      - name: checkout Linux-src if not cached
+        if: steps.cache-linux-src.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: 'torvalds/linux'
+          ref: 'v6.7'
+          path: 'Linux-src'
+
+      - name: download erofs-utils binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: erofs-utils-binaries
+
+      - name: untar erofs-utils binaries
+        run:
+          tar -xvf erofs-utils-binaries.tar
+
+      - name: test mkfs.erofs
+        run: |
+          ./mkfs.erofs --quiet ${{ matrix.worker }} ${{ matrix.algorithm }} ${{ matrix.dedupe }} ${{ matrix.fragments }} ${{ matrix.ztailpacking }} erofs-test.img Linux-src/
+          ./fsck.erofs --extract=extract-dir/ erofs-test.img
+
+          HASH1=$(find extract-dir -type f -exec sha256sum {} + | sed 's/extract-dir//g' | sort -k2 | sha256sum -)
+          HASH2=$(find Linux-src -type f -exec sha256sum {} + | sed 's/Linux-src//g' | sort -k2 | sha256sum -)
+          if [ "$HASH1" = "$HASH2" ]; then
+            echo "PASS!"
+          fi
