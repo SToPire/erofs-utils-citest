@@ -8,9 +8,6 @@
 #ifndef _LARGEFILE64_SOURCE
 #define _LARGEFILE64_SOURCE
 #endif
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -25,9 +22,6 @@
 #include "erofs/fragments.h"
 #ifdef EROFS_MT_ENABLED
 #include "erofs/workqueue.h"
-#endif
-#ifdef HAVE_LINUX_FALLOC_H
-#include <linux/falloc.h>
 #endif
 
 /* compressing configuration specified by users */
@@ -73,8 +67,9 @@ struct z_erofs_compress_sctx {		/* segment context */
 	u16 clusterofs;
 
 	int seg_num, seg_idx;
-	FILE *tmpfile;
-	off_t tmpfile_off;
+
+	void *membuf;
+	erofs_off_t memoff;
 };
 
 #ifdef EROFS_MT_ENABLED
@@ -82,7 +77,6 @@ struct erofs_compress_wq_private {
 	u8 *queue;
 	char *destbuf;
 	struct erofs_compress_cfg *ccfg;
-	FILE* tmpfile;
 };
 
 struct erofs_compress_work {
@@ -393,11 +387,10 @@ static int write_uncompressed_extent(struct z_erofs_compress_sctx *ctx,
 	memcpy(dst + interlaced_offset, ctx->queue + ctx->head, rightpart);
 	memcpy(dst, ctx->queue + ctx->head + rightpart, count - rightpart);
 
-	if (ctx->tmpfile) {
-		erofs_dbg("Writing %u uncompressed data to tmpfile", count);
-		ret = fwrite(dst, erofs_blksiz(sbi), 1, ctx->tmpfile);
-		if (ret != 1)
-			return -EIO;
+	if (ctx->membuf) {
+		erofs_dbg("Writing %u uncompressed data to membuf", count);
+		memcpy(ctx->membuf + ctx->memoff, dst, erofs_blksiz(sbi));
+		ctx->memoff += erofs_blksiz(sbi);
 	} else {
 		erofs_dbg("Writing %u uncompressed data to block %u", count,
 			  ctx->blkaddr);
@@ -640,14 +633,13 @@ frag_packing:
 		}
 
 		/* write compressed data */
-		if (ctx->tmpfile) {
-			erofs_dbg("Writing %u compressed data to tmpfile of %u blocks",
+		if (ctx->membuf) {
+			erofs_off_t sz = e->compressedblks * blksz;
+			erofs_dbg("Writing %u compressed data to membuf of %u blocks",
 				  e->length, e->compressedblks);
 
-			ret = fwrite(dst - padding, erofs_blksiz(sbi),
-				     e->compressedblks, ctx->tmpfile);
-			if (ret != e->compressedblks)
-				return -EIO;
+			memcpy(ctx->membuf + ctx->memoff, dst - padding, sz);
+			ctx->memoff += sz;
 		} else {
 			erofs_dbg("Writing %u compressed data to %u of %u blocks",
 				  e->length, ctx->blkaddr, e->compressedblks);
@@ -1031,10 +1023,6 @@ int z_erofs_compress_segment(struct z_erofs_compress_sctx *ctx,
 }
 
 #ifdef EROFS_MT_ENABLED
-#if defined(HAVE_FALLOCATE) && defined(FALLOC_FL_PUNCH_HOLE)
-#define USE_PER_WORKER_TMPFILE 1
-#endif
-
 void *z_erofs_mt_private_alloc(struct erofs_workqueue *wq, void *ptr)
 {
 	struct erofs_compress_wq_private *priv;
@@ -1053,20 +1041,9 @@ void *z_erofs_mt_private_alloc(struct erofs_workqueue *wq, void *ptr)
 	priv->ccfg = calloc(EROFS_MAX_COMPR_CFGS, sizeof(*priv->ccfg));
 	if (!priv->ccfg)
 		goto err_free_destbuf;
-#ifdef USE_PER_WORKER_TMPFILE
-#ifndef HAVE_TMPFILE64
-	priv->tmpfile = tmpfile();
-#else
-	priv->tmpfile = tmpfile64();
-#endif
-	if (!priv->tmpfile)
-		goto err_free_ccfg;
-#endif
 
 	return priv;
 
-err_free_ccfg:
-	free(priv->ccfg);
 err_free_destbuf:
 	free(priv->destbuf);
 err_free_queue:
@@ -1109,9 +1086,6 @@ void *z_erofs_mt_private_free(struct erofs_workqueue *wq, void *private)
 	free(priv->ccfg);
 	free(priv->destbuf);
 	free(priv->queue);
-#ifdef USE_PER_WORKER_TMPFILE
-	fclose(priv->tmpfile);
-#endif
 
 	free(priv);
 	return NULL;
@@ -1136,36 +1110,15 @@ void z_erofs_mt_workfn(struct erofs_work *work)
 	ctx->destbuf = priv->destbuf;
 	ctx->chandle = &priv->ccfg[cwork->alg_id].handle;
 
-	if (priv->tmpfile) {
-		ctx->tmpfile = priv->tmpfile;
-		ctx->tmpfile_off = ftell(ctx->tmpfile);
-		if (ctx->tmpfile_off < 0) {
-			ret = -errno;
-			goto out;
-		}
-	} else {
-#ifdef HAVE_TMPFILE64
-		ctx->tmpfile = tmpfile64();
-#else
-		ctx->tmpfile = tmpfile();
-#endif
-		if (!ctx->tmpfile) {
-			ret = -errno;
-			goto out;
-		}
-		ctx->tmpfile_off = 0;
+	ctx->membuf = malloc(ctx->remaining);
+	if (!ctx->membuf) {
+		ret = -ENOMEM;
+		goto out;
 	}
+	ctx->memoff = 0;
 
 	ret = z_erofs_compress_segment(ctx, offset, EROFS_NULL_ADDR);
-	if (ret)
-		goto out;
-	fflush(ctx->tmpfile);
 
-	if (priv->tmpfile) {
-		ret = fseek(ctx->tmpfile, ctx->tmpfile_off, SEEK_SET);
-		if (ret)
-			ret = ferror(ctx->tmpfile);
-	}
 out:
 	cwork->errcode = ret;
 	pthread_mutex_lock(&z_erofs_mt_ctrl.mutex);
@@ -1175,17 +1128,14 @@ out:
 }
 
 int z_erofs_merge_segment(struct z_erofs_compress_ictx *ictx,
-			  struct z_erofs_compress_sctx *ctx,
-			  char **memblock)
+			  struct z_erofs_compress_sctx *ctx)
 {
 	struct z_erofs_extent_item *ei, *n;
 	struct erofs_sb_info *sbi = ictx->inode->sbi;
-	unsigned int bsz = erofs_blksiz(ictx->inode->sbi);
+	erofs_blk_t blkoff = 0;
 	int ret = 0, ret2;
 
 	list_for_each_entry_safe(ei, n, &ctx->extents, list) {
-		unsigned int sz = ei->e.compressedblks * bsz;
-
 		list_del(&ei->list);
 		list_add_tail(&ei->list, &ictx->extents);
 
@@ -1195,25 +1145,15 @@ int z_erofs_merge_segment(struct z_erofs_compress_ictx *ictx,
 		ei->e.blkaddr = ctx->blkaddr;
 		ctx->blkaddr += ei->e.compressedblks;
 
-		*memblock = realloc(*memblock, sz);
-		if (!*memblock) {
-			ret = -ENOMEM;
-			continue;
-		}
-
-		ret2 = fread(*memblock, sz, 1, ctx->tmpfile);
-		if (ret2 != 1) {
-			ret = ret2 < 0 ? -errno: -EIO;
-			continue;
-		}
-
-		ret2 = blk_write(sbi, *memblock, ei->e.blkaddr,
-				 ei->e.compressedblks);
+		ret2 = blk_write(sbi, ctx->membuf + blkoff * erofs_blksiz(sbi),
+				 ei->e.blkaddr, ei->e.compressedblks);
+		blkoff += ei->e.compressedblks;
 		if (ret2) {
 			ret = ret2;
 			continue;
 		}
 	}
+	free(ctx->membuf);
 	return ret;
 }
 
@@ -1224,7 +1164,6 @@ int z_erofs_mt_compress(struct z_erofs_compress_ictx *ctx,
 {
 	struct erofs_compress_work *cur, *head = NULL, **last = &head;
 	struct erofs_inode *inode = ctx->inode;
-	char *memblock = NULL;
 	int nsegs = DIV_ROUND_UP(inode->i_size, cfg.c_segment_size);
 	int ret, i;
 
@@ -1284,7 +1223,7 @@ int z_erofs_mt_compress(struct z_erofs_compress_ictx *ctx,
 			int ret2;
 
 			cur->ctx.blkaddr = blkaddr;
-			ret2 = z_erofs_merge_segment(ctx, &cur->ctx, &memblock);
+			ret2 = z_erofs_merge_segment(ctx, &cur->ctx);
 			if (ret2)
 				ret = ret2;
 
@@ -1292,13 +1231,9 @@ int z_erofs_mt_compress(struct z_erofs_compress_ictx *ctx,
 			blkaddr = cur->ctx.blkaddr;
 		}
 
-#ifndef USE_PER_WORKER_TMPFILE
-		fclose(ctx->tmpfile);
-#endif
 		cur->next = z_erofs_mt_ctrl.idle;
 		z_erofs_mt_ctrl.idle = cur;
 	}
-	free(memblock);
 	return ret;
 }
 #endif
