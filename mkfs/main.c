@@ -678,7 +678,7 @@ static int mkfs_parse_options_cfg(int argc, char *argv[])
 
 			processors = erofs_get_available_processors();
 			if (cfg.c_mt_workers > processors)
-				erofs_warn("the number of workers %d is more than the number of processors %d, performance may be impacted.",
+				erofs_warn("%d workers exceed %d processors, potentially impacting performance.",
 					   cfg.c_mt_workers, processors);
 			break;
 		}
@@ -838,6 +838,12 @@ static int mkfs_parse_options_cfg(int argc, char *argv[])
 		}
 		cfg.c_pclusterblks_packed = pclustersize_packed >> sbi.blkszbits;
 	}
+#ifdef EROFS_MT_ENABLED
+	if (cfg.c_mt_workers > 1 && (cfg.c_dedupe || cfg.c_fragments)) {
+		erofs_warn("Note that dedupe/fragments are NOT supported in multi-threaded mode for now, reseting --workers=1.");
+		cfg.c_mt_workers = 1;
+	}
+#endif
 	return 0;
 }
 
