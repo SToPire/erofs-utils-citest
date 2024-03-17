@@ -27,7 +27,12 @@
 #include "erofs/compress_hints.h"
 #include "erofs/blobchunk.h"
 #include "erofs/fragments.h"
+#ifdef EROFS_MT_ENABLED
+#include "erofs/queue.h"
+#endif
 #include "liberofs_private.h"
+
+extern bool z_erofs_mt_enabled;
 
 #define S_SHIFT                 12
 static unsigned char erofs_ftype_by_mode[S_IFMT >> S_SHIFT] = {
@@ -1036,6 +1041,9 @@ struct erofs_inode *erofs_new_inode(void)
 	inode->i_ino[0] = sbi.inos++;	/* inode serial number */
 	inode->i_count = 1;
 	inode->datalayout = EROFS_INODE_FLAT_PLAIN;
+#ifdef EROFS_MT_ENABLED
+	inode->mt_desc = NULL;
+#endif
 
 	init_list_head(&inode->i_hash);
 	init_list_head(&inode->i_subdirs);
@@ -1100,6 +1108,10 @@ static void erofs_fixup_meta_blkaddr(struct erofs_inode *rootdir)
 	rootdir->nid = (off - meta_offset) >> EROFS_ISLOTBITS;
 }
 
+#ifdef EROFS_MT_ENABLED
+#define EROFS_MT_QUEUE_SIZE 256
+struct erofs_queue *z_erofs_mt_queue;
+#endif
 
 static int erofs_mkfs_handle_symlink(struct erofs_inode *inode)
 {
@@ -1143,14 +1155,69 @@ static int erofs_mkfs_handle_file(struct erofs_inode *inode)
 	return 0;
 }
 
+static int erofs_mkfs_issue_compress(struct erofs_inode *inode)
+{
+	if (!inode->i_size)
+		return 0;
+
+	if (!S_ISLNK(inode->i_mode) && cfg.c_compr_opts[0].alg &&
+	    erofs_file_is_compressible(inode)) {
+		int fd = open(inode->i_srcpath, O_RDONLY | O_BINARY);
+		if (fd < 0)
+			return -errno;
+		return erofs_write_compressed_file(inode, fd);
+	}
+
+	return 0;
+}
+
 static int erofs_mkfs_handle_dir(struct erofs_inode *dir,
-				 struct list_head *dirs)
+				 struct list_head *dirs, bool ismt)
 {
 	int ret;
 	DIR *_dir;
 	struct dirent *dp;
 	struct erofs_dentry *d;
-	unsigned int nr_subdirs = 0, i_nlink;
+	unsigned int nr_subdirs, i_nlink;
+
+	ret = erofs_scan_file_xattrs(dir);
+	if (ret < 0)
+		return ret;
+
+	ret = erofs_prepare_xattr_ibody(dir);
+	if (ret < 0)
+		return ret;
+
+	if (!S_ISDIR(dir->i_mode)) {
+		if (S_ISLNK(dir->i_mode)) {
+			char *const symlink = malloc(dir->i_size);
+
+			if (!symlink)
+				return -ENOMEM;
+			ret = readlink(dir->i_srcpath, symlink, dir->i_size);
+			if (ret < 0) {
+				free(symlink);
+				return -errno;
+			}
+			ret = erofs_write_file_from_buffer(dir, symlink);
+			free(symlink);
+		} else if (dir->i_size) {
+			int fd = open(dir->i_srcpath, O_RDONLY | O_BINARY);
+			if (fd < 0)
+				return -errno;
+
+			ret = erofs_write_file(dir, fd, 0);
+			close(fd);
+		} else {
+			ret = 0;
+		}
+		if (ret)
+			return ret;
+
+		erofs_prepare_inode_buffer(dir);
+		erofs_write_tail_end(dir);
+		return 0;
+	}
 
 	_dir = opendir(dir->i_srcpath);
 	if (!_dir) {
@@ -1195,13 +1262,15 @@ static int erofs_mkfs_handle_dir(struct erofs_inode *dir,
 	if (ret)
 		return ret;
 
-	ret = erofs_prepare_inode_buffer(dir);
-	if (ret)
-		return ret;
-	dir->bh->op = &erofs_skip_write_bhops;
+	if (!ismt) {
+		ret = erofs_prepare_inode_buffer(dir);
+		if (ret)
+			return ret;
+		dir->bh->op = &erofs_skip_write_bhops;
 
-	if (IS_ROOT(dir))
-		erofs_fixup_meta_blkaddr(dir);
+		if (IS_ROOT(dir))
+			erofs_fixup_meta_blkaddr(dir);
+	}
 
 	i_nlink = 0;
 	list_for_each_entry(d, &dir->i_subdirs, d_child) {
@@ -1286,7 +1355,7 @@ static void erofs_mkfs_dumpdir(struct erofs_inode *dumpdir)
 }
 
 static int erofs_mkfs_build_tree(struct erofs_inode *dir,
-				 struct list_head *dirs)
+				 struct list_head *dirs, bool ismt)
 {
 	int ret;
 
@@ -1299,12 +1368,15 @@ static int erofs_mkfs_build_tree(struct erofs_inode *dir,
 		return ret;
 
 	if (S_ISDIR(dir->i_mode))
-		return erofs_mkfs_handle_dir(dir, dirs);
+		return erofs_mkfs_handle_dir(dir, dirs, ismt);
+	else if (ismt)
+		return erofs_mkfs_issue_compress(dir);
 	else
 		return erofs_mkfs_handle_file(dir);
 }
 
-struct erofs_inode *erofs_mkfs_build_tree_from_path(const char *path)
+struct erofs_inode *__erofs_mkfs_build_tree_from_path(const char *path,
+						      bool ismt)
 {
 	LIST_HEAD(dirs);
 	struct erofs_inode *inode, *root, *dumpdir;
@@ -1325,23 +1397,163 @@ struct erofs_inode *erofs_mkfs_build_tree_from_path(const char *path)
 		list_del(&inode->i_subdirs);
 		init_list_head(&inode->i_subdirs);
 
-		erofs_mkfs_print_progressinfo(inode);
+		if (!ismt)
+			erofs_mkfs_print_progressinfo(inode);
 
-		err = erofs_mkfs_build_tree(inode, &dirs);
+		err = erofs_mkfs_build_tree(inode, &dirs, ismt);
 		if (err) {
 			root = ERR_PTR(err);
 			break;
 		}
 
-		if (S_ISDIR(inode->i_mode)) {
-			inode->next_dirwrite = dumpdir;
-			dumpdir = inode;
+		if (!ismt) {
+			if (S_ISDIR(inode->i_mode)) {
+				inode->next_dirwrite = dumpdir;
+				dumpdir = inode;
+			} else {
+				erofs_iput(inode);
+			}
+#ifdef EROFS_MT_ENABLED
 		} else {
-			erofs_iput(inode);
+			erofs_push_queue(z_erofs_mt_queue, &inode);
+#endif
 		}
 	} while (!list_empty(&dirs));
 
+	if (!ismt)
+		erofs_mkfs_dumpdir(dumpdir);
+#ifdef EROFS_MT_ENABLED
+	else
+		erofs_push_queue(z_erofs_mt_queue, &dumpdir);
+#endif
+	return root;
+}
+
+#ifdef EROFS_MT_ENABLED
+pthread_t z_erofs_mt_traverser;
+
+void *z_erofs_mt_traverse_task(void *path)
+{
+	pthread_exit((void *)__erofs_mkfs_build_tree_from_path(path, true));
+}
+
+static int z_erofs_mt_reap_compressed(struct erofs_inode *inode)
+{
+	struct z_erofs_mt_file *desc = inode->mt_desc;
+	int fd = desc->fd;
+	int ret = 0;
+
+	pthread_mutex_lock(&desc->mutex);
+	while (desc->nfini != desc->total)
+		pthread_cond_wait(&desc->cond, &desc->mutex);
+	pthread_mutex_unlock(&desc->mutex);
+
+	ret = z_erofs_mt_reap(desc);
+	if (ret == -ENOSPC) {
+		ret = lseek(fd, 0, SEEK_SET);
+		if (ret < 0)
+			return -errno;
+
+		ret = write_uncompressed_file_from_fd(inode, fd);
+	}
+
+	close(fd);
+	return ret;
+}
+
+static int z_erofs_mt_reap_inodes()
+{
+	struct erofs_inode *inode, *dumpdir;
+	int ret = 0;
+
+	dumpdir = NULL;
+	while (true) {
+		inode = *(struct erofs_inode **)erofs_pop_queue(
+			z_erofs_mt_queue);
+		if (!inode)
+			break;
+
+		erofs_mkfs_print_progressinfo(inode);
+
+		if (S_ISDIR(inode->i_mode)) {
+			ret = erofs_prepare_inode_buffer(inode);
+			if (ret)
+				goto out;
+			inode->bh->op = &erofs_skip_write_bhops;
+
+			if (IS_ROOT(inode))
+				erofs_fixup_meta_blkaddr(inode);
+
+			inode->next_dirwrite = dumpdir;
+			dumpdir = inode;
+			continue;
+		}
+
+		if (inode->mt_desc) {
+			ret = z_erofs_mt_reap_compressed(inode);
+		} else if (S_ISLNK(inode->i_mode)) {
+			ret = erofs_mkfs_handle_symlink(inode);
+		} else if (!inode->i_size) {
+			ret = 0;
+		} else {
+			int fd = open(inode->i_srcpath, O_RDONLY | O_BINARY);
+			if (fd < 0)
+				return -errno;
+
+			if (cfg.c_chunkbits)
+				ret = erofs_write_chunked_file(inode, fd, 0);
+			else
+				ret = write_uncompressed_file_from_fd(inode,
+								      fd);
+			close(fd);
+		}
+		if (ret)
+			goto out;
+
+		erofs_prepare_inode_buffer(inode);
+		erofs_write_tail_end(inode);
+		erofs_iput(inode);
+	}
+
 	erofs_mkfs_dumpdir(dumpdir);
+
+out:
+	return ret;
+}
+#endif
+
+struct erofs_inode *erofs_mkfs_build_tree_from_path(const char *path)
+{
+#ifdef EROFS_MT_ENABLED
+	int err;
+#endif
+	struct erofs_inode *root = NULL;
+
+	if (!z_erofs_mt_enabled)
+		return __erofs_mkfs_build_tree_from_path(path, false);
+
+#ifdef EROFS_MT_ENABLED
+	z_erofs_mt_queue = erofs_alloc_queue(EROFS_MT_QUEUE_SIZE,
+					     sizeof(struct erofs_inode *));
+	if (IS_ERR(z_erofs_mt_queue))
+		return ERR_CAST(z_erofs_mt_queue);
+
+	err = pthread_create(&z_erofs_mt_traverser, NULL,
+			     z_erofs_mt_traverse_task, (void *)path);
+	if (err)
+		return ERR_PTR(err);
+
+	err = z_erofs_mt_reap_inodes();
+	if (err)
+		return ERR_PTR(err);
+
+	err = pthread_join(z_erofs_mt_traverser, (void *)&root);
+	if (err)
+		return ERR_PTR(err);
+
+	erofs_destroy_queue(z_erofs_mt_queue);
+#endif
+
 	return root;
 }
 
