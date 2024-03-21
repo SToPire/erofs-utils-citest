@@ -41,6 +41,23 @@ struct erofs_inode *erofs_new_inode(void);
 struct erofs_inode *erofs_mkfs_build_tree_from_path(const char *path);
 struct erofs_inode *erofs_mkfs_build_special_from_fd(int fd, const char *name);
 
+#ifdef EROFS_MT_ENABLED
+struct erofs_inode_fifo {
+	pthread_mutex_t lock;
+	pthread_cond_t full, empty;
+
+	void *buf;
+
+	size_t size, elem_size;
+	size_t head, tail;
+};
+
+struct erofs_inode_fifo *erofs_alloc_inode_fifo(size_t size, size_t elem_size);
+void erofs_push_inode_fifo(struct erofs_inode_fifo *q, void *elem);
+void *erofs_pop_inode_fifo(struct erofs_inode_fifo *q);
+void erofs_destroy_inode_fifo(struct erofs_inode_fifo *q);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
