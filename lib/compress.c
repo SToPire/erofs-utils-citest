@@ -86,6 +86,7 @@ struct erofs_compress_work {
 	struct erofs_work work;
 	struct z_erofs_compress_sctx ctx;
 	struct erofs_compress_work *next;
+	struct z_erofs_mt_file *mtfile_desc;
 
 	unsigned int alg_id;
 	char *alg_name;
@@ -97,14 +98,14 @@ struct erofs_compress_work {
 
 static struct {
 	struct erofs_workqueue wq;
-	struct erofs_compress_work *idle;
-	pthread_mutex_t mutex;
-	pthread_cond_t cond;
-	int nfini;
+	struct erofs_compress_work *work_idle;
+	pthread_mutex_t work_mutex;
+	struct z_erofs_mt_file *file_idle;
+	pthread_mutex_t file_mutex;
 } z_erofs_mt_ctrl;
 #endif
 
-static bool z_erofs_mt_enabled;
+bool z_erofs_mt_enabled;
 
 #define Z_EROFS_LEGACY_MAP_HEADER_SIZE	Z_EROFS_FULL_INDEX_ALIGN(0)
 
@@ -1026,6 +1027,90 @@ int z_erofs_compress_segment(struct z_erofs_compress_sctx *ctx,
 	return 0;
 }
 
+int z_erofs_finalize_compression(struct z_erofs_compress_ictx *ictx,
+				 struct erofs_buffer_head *bh,
+				 erofs_blk_t blkaddr,
+				 erofs_blk_t compressed_blocks)
+{
+	struct erofs_inode *inode = ictx->inode;
+	struct erofs_sb_info *sbi = inode->sbi;
+	u8 *compressmeta = ictx->metacur - Z_EROFS_LEGACY_MAP_HEADER_SIZE;
+	unsigned int legacymetasize;
+	int ret = 0;
+
+	/* fall back to no compression mode */
+	DBG_BUGON(compressed_blocks < !!inode->idata_size);
+	compressed_blocks -= !!inode->idata_size;
+
+	z_erofs_write_indexes(ictx);
+	legacymetasize = ictx->metacur - compressmeta;
+	/* estimate if data compression saves space or not */
+	if (!inode->fragment_size &&
+	    compressed_blocks * erofs_blksiz(sbi) + inode->idata_size +
+	    legacymetasize >= inode->i_size) {
+		z_erofs_dedupe_commit(true);
+
+		if (inode->idata) {
+			free(inode->idata);
+			inode->idata = NULL;
+		}
+		erofs_bdrop(bh, true); /* revoke buffer */
+		free(compressmeta);
+		inode->compressmeta = NULL;
+
+		return -ENOSPC;
+	}
+	z_erofs_dedupe_commit(false);
+	z_erofs_write_mapheader(inode, compressmeta);
+
+	if (!ictx->fragemitted)
+		sbi->saved_by_deduplication += inode->fragment_size;
+
+	/* if the entire file is a fragment, a simplified form is used. */
+	if (inode->i_size <= inode->fragment_size) {
+		DBG_BUGON(inode->i_size < inode->fragment_size);
+		DBG_BUGON(inode->fragmentoff >> 63);
+		*(__le64 *)compressmeta =
+			cpu_to_le64(inode->fragmentoff | 1ULL << 63);
+		inode->datalayout = EROFS_INODE_COMPRESSED_FULL;
+		legacymetasize = Z_EROFS_LEGACY_MAP_HEADER_SIZE;
+	}
+
+	if (compressed_blocks) {
+		ret = erofs_bh_balloon(bh, erofs_pos(sbi, compressed_blocks));
+		DBG_BUGON(ret != erofs_blksiz(sbi));
+	} else {
+		if (!cfg.c_fragments && !cfg.c_dedupe)
+			DBG_BUGON(!inode->idata_size);
+	}
+
+	erofs_info("compressed %s (%llu bytes) into %u blocks",
+		   inode->i_srcpath, (unsigned long long)inode->i_size,
+		   compressed_blocks);
+
+	if (inode->idata_size) {
+		bh->op = &erofs_skip_write_bhops;
+		inode->bh_data = bh;
+	} else {
+		erofs_bdrop(bh, false);
+	}
+
+	inode->u.i_blocks = compressed_blocks;
+
+	if (inode->datalayout == EROFS_INODE_COMPRESSED_FULL) {
+		inode->extent_isize = legacymetasize;
+	} else {
+		ret = z_erofs_convert_to_compacted_format(inode, blkaddr,
+							  legacymetasize,
+							  compressmeta);
+		DBG_BUGON(ret);
+	}
+	inode->compressmeta = compressmeta;
+	if (!erofs_is_packed_inode(inode))
+		erofs_droid_blocklist_write(inode, blkaddr, compressed_blocks);
+	return 0;
+}
+
 #ifdef EROFS_MT_ENABLED
 void *z_erofs_mt_wq_tls_alloc(struct erofs_workqueue *wq, void *ptr)
 {
@@ -1100,6 +1185,7 @@ void z_erofs_mt_workfn(struct erofs_work *work, void *tlsp)
 	struct erofs_compress_work *cwork = (struct erofs_compress_work *)work;
 	struct erofs_compress_wq_tls *tls = tlsp;
 	struct z_erofs_compress_sctx *sctx = &cwork->ctx;
+	struct z_erofs_mt_file *mtfile_desc = cwork->mtfile_desc;
 	struct erofs_inode *inode = sctx->ictx->inode;
 	struct erofs_sb_info *sbi = inode->sbi;
 	int ret = 0;
@@ -1127,10 +1213,10 @@ void z_erofs_mt_workfn(struct erofs_work *work, void *tlsp)
 
 out:
 	cwork->errcode = ret;
-	pthread_mutex_lock(&z_erofs_mt_ctrl.mutex);
-	++z_erofs_mt_ctrl.nfini;
-	pthread_cond_signal(&z_erofs_mt_ctrl.cond);
-	pthread_mutex_unlock(&z_erofs_mt_ctrl.mutex);
+	pthread_mutex_lock(&mtfile_desc->mutex);
+	++mtfile_desc->nfini;
+	pthread_cond_signal(&mtfile_desc->cond);
+	pthread_mutex_unlock(&mtfile_desc->mutex);
 }
 
 int z_erofs_merge_segment(struct z_erofs_compress_ictx *ictx,
@@ -1164,27 +1250,59 @@ int z_erofs_merge_segment(struct z_erofs_compress_ictx *ictx,
 }
 
 int z_erofs_mt_compress(struct z_erofs_compress_ictx *ictx,
-			struct erofs_compress_cfg *ccfg,
-			erofs_blk_t blkaddr,
-			erofs_blk_t *compressed_blocks)
+			struct erofs_compress_cfg *ccfg)
 {
 	struct erofs_compress_work *cur, *head = NULL, **last = &head;
 	struct erofs_inode *inode = ictx->inode;
+	struct z_erofs_mt_file *mtfile_desc = NULL;
 	int nsegs = DIV_ROUND_UP(inode->i_size, cfg.c_segment_size);
-	int ret, i;
+	int i;
 
-	z_erofs_mt_ctrl.nfini = 0;
+	pthread_mutex_lock(&z_erofs_mt_ctrl.file_mutex);
+	if (z_erofs_mt_ctrl.file_idle) {
+		mtfile_desc = z_erofs_mt_ctrl.file_idle;
+		z_erofs_mt_ctrl.file_idle = mtfile_desc->next;
+		mtfile_desc->next = NULL;
+	}
+	pthread_mutex_unlock(&z_erofs_mt_ctrl.file_mutex);
+	if (!mtfile_desc) {
+		mtfile_desc = calloc(1, sizeof(*mtfile_desc));
+		if (!mtfile_desc)
+			return -ENOMEM;
+	}
+	inode->mt_desc = mtfile_desc;
+
+	mtfile_desc->fd = ictx->fd;
+	mtfile_desc->total = nsegs;
+	mtfile_desc->nfini = 0;
+	pthread_mutex_init(&mtfile_desc->mutex, NULL);
+	pthread_cond_init(&mtfile_desc->cond, NULL);
 
 	for (i = 0; i < nsegs; i++) {
-		if (z_erofs_mt_ctrl.idle) {
-			cur = z_erofs_mt_ctrl.idle;
-			z_erofs_mt_ctrl.idle = cur->next;
+		cur = NULL;
+
+		pthread_mutex_lock(&z_erofs_mt_ctrl.work_mutex);
+		if (z_erofs_mt_ctrl.work_idle) {
+			cur = z_erofs_mt_ctrl.work_idle;
+			z_erofs_mt_ctrl.work_idle = cur->next;
 			cur->next = NULL;
-		} else {
-			cur = calloc(1, sizeof(*cur));
-			if (!cur)
-				return -ENOMEM;
 		}
+		pthread_mutex_unlock(&z_erofs_mt_ctrl.work_mutex);
+		if (!cur) {
+			cur = calloc(1, sizeof(*cur));
+			if (!cur) {
+				while (head) {
+					cur = head;
+					head = cur->next;
+					free(cur);
+				}
+				free(mtfile_desc);
+				return -ENOMEM;
+			}
+		}
+
+		if (i == 0)
+			mtfile_desc->head = cur;
 		*last = cur;
 		last = &cur->next;
 
@@ -1208,21 +1326,30 @@ int z_erofs_mt_compress(struct z_erofs_compress_ictx *ictx,
 		cur->comp_level = ccfg->handle.compression_level;
 		cur->dict_size = ccfg->handle.dict_size;
 
+		cur->mtfile_desc = mtfile_desc;
 		cur->work.fn = z_erofs_mt_workfn;
 		erofs_queue_work(&z_erofs_mt_ctrl.wq, &cur->work);
 	}
 
-	pthread_mutex_lock(&z_erofs_mt_ctrl.mutex);
-	while (z_erofs_mt_ctrl.nfini != nsegs)
-		pthread_cond_wait(&z_erofs_mt_ctrl.cond,
-				  &z_erofs_mt_ctrl.mutex);
-	pthread_mutex_unlock(&z_erofs_mt_ctrl.mutex);
+	return 0;
+}
 
-	ret = 0;
-	while (head) {
-		cur = head;
-		head = cur->next;
+int z_erofs_mt_reap(struct z_erofs_mt_file *desc)
+{
+	struct erofs_buffer_head *bh = NULL;
+	struct erofs_compress_work *cur = desc->head, *tmp;
+	struct z_erofs_compress_ictx *ictx = cur->ctx.ictx;
+	erofs_blk_t blkaddr, compressed_blocks = 0;
+	int ret = 0;
 
+	bh = erofs_balloc(DATA, 0, 0, 0);
+	if (IS_ERR(bh)) {
+		ret = PTR_ERR(bh);
+		goto out;
+	}
+	blkaddr = erofs_mapbh(bh->block);
+
+	while (cur) {
 		if (cur->errcode) {
 			ret = cur->errcode;
 		} else {
@@ -1233,13 +1360,30 @@ int z_erofs_mt_compress(struct z_erofs_compress_ictx *ictx,
 			if (ret2)
 				ret = ret2;
 
-			*compressed_blocks += cur->ctx.blkaddr - blkaddr;
+			compressed_blocks += cur->ctx.blkaddr - blkaddr;
 			blkaddr = cur->ctx.blkaddr;
 		}
 
-		cur->next = z_erofs_mt_ctrl.idle;
-		z_erofs_mt_ctrl.idle = cur;
+		tmp = cur->next;
+		pthread_mutex_lock(&z_erofs_mt_ctrl.work_mutex);
+		cur->next = z_erofs_mt_ctrl.work_idle;
+		z_erofs_mt_ctrl.work_idle = cur;
+		pthread_mutex_unlock(&z_erofs_mt_ctrl.work_mutex);
+		cur = tmp;
 	}
+	if (ret)
+		goto out;
+
+	ret = z_erofs_finalize_compression(
+		ictx, bh, blkaddr - compressed_blocks, compressed_blocks);
+
+out:
+	free(ictx);
+	pthread_mutex_lock(&z_erofs_mt_ctrl.file_mutex);
+	desc->next = z_erofs_mt_ctrl.file_idle;
+	z_erofs_mt_ctrl.file_idle = desc;
+	pthread_mutex_unlock(&z_erofs_mt_ctrl.file_mutex);
+
 	return ret;
 }
 #endif
@@ -1252,9 +1396,7 @@ int erofs_write_compressed_file(struct erofs_inode *inode, int fd, u64 fpos)
 	static struct z_erofs_compress_sctx sctx;
 	struct erofs_compress_cfg *ccfg;
 	erofs_blk_t blkaddr, compressed_blocks = 0;
-	unsigned int legacymetasize;
 	int ret;
-	bool ismt = false;
 	struct erofs_sb_info *sbi = inode->sbi;
 	u8 *compressmeta = malloc(BLK_ROUND_UP(sbi, inode->i_size) *
 				  sizeof(struct z_erofs_lcluster_index) +
@@ -1263,11 +1405,17 @@ int erofs_write_compressed_file(struct erofs_inode *inode, int fd, u64 fpos)
 	if (!compressmeta)
 		return -ENOMEM;
 
-	/* allocate main data buffer */
-	bh = erofs_balloc(DATA, 0, 0, 0);
-	if (IS_ERR(bh)) {
-		ret = PTR_ERR(bh);
-		goto err_free_meta;
+	if (!z_erofs_mt_enabled) {
+		/* allocate main data buffer */
+		bh = erofs_balloc(DATA, 0, 0, 0);
+		if (IS_ERR(bh)) {
+			ret = PTR_ERR(bh);
+			goto err_free_meta;
+		}
+		blkaddr = erofs_mapbh(bh->block); /* start_blkaddr */
+	} else {
+		bh = NULL;
+		blkaddr = EROFS_NULL_ADDR;
 	}
 
 	/* initialize per-file compression setting */
@@ -1316,7 +1464,6 @@ int erofs_write_compressed_file(struct erofs_inode *inode, int fd, u64 fpos)
 			goto err_bdrop;
 	}
 
-	blkaddr = erofs_mapbh(bh->block);	/* start_blkaddr */
 	ctx.inode = inode;
 	ctx.fd = fd;
 	ctx.fpos = fpos;
@@ -1333,11 +1480,24 @@ int erofs_write_compressed_file(struct erofs_inode *inode, int fd, u64 fpos)
 		if (ret)
 			goto err_free_idata;
 #ifdef EROFS_MT_ENABLED
-	} else if (z_erofs_mt_enabled && inode->i_size > cfg.c_segment_size) {
-		ismt = true;
-		ret = z_erofs_mt_compress(&ctx, ccfg, blkaddr, &compressed_blocks);
-		if (ret)
+	} else if (z_erofs_mt_enabled) {
+		struct z_erofs_compress_ictx *l_ictx;
+
+		l_ictx = malloc(sizeof(*l_ictx));
+		if (!l_ictx) {
+			ret = -ENOMEM;
 			goto err_free_idata;
+		}
+
+		memcpy(l_ictx, &ctx, sizeof(*l_ictx));
+		init_list_head(&l_ictx->extents);
+
+		ret = z_erofs_mt_compress(l_ictx, ccfg);
+		if (ret) {
+			free(l_ictx);
+			goto err_free_idata;
+		}
+		return 0;
 #endif
 	} else {
 		sctx.queue = g_queue;
@@ -1354,10 +1514,6 @@ int erofs_write_compressed_file(struct erofs_inode *inode, int fd, u64 fpos)
 			goto err_free_idata;
 		compressed_blocks = sctx.blkaddr - blkaddr;
 	}
-
-	/* fall back to no compression mode */
-	DBG_BUGON(compressed_blocks < !!inode->idata_size);
-	compressed_blocks -= !!inode->idata_size;
 
 	/* generate an extent for the deduplicated fragment */
 	if (inode->fragment_size && !ctx.fragemitted) {
@@ -1380,69 +1536,10 @@ int erofs_write_compressed_file(struct erofs_inode *inode, int fd, u64 fpos)
 		z_erofs_commit_extent(&sctx, ei);
 	}
 	z_erofs_fragments_commit(inode);
+	list_splice_tail(&sctx.extents, &ctx.extents);
 
-	if (!ismt)
-		list_splice_tail(&sctx.extents, &ctx.extents);
-
-	z_erofs_write_indexes(&ctx);
-	legacymetasize = ctx.metacur - compressmeta;
-	/* estimate if data compression saves space or not */
-	if (!inode->fragment_size &&
-	    compressed_blocks * erofs_blksiz(sbi) + inode->idata_size +
-	    legacymetasize >= inode->i_size) {
-		z_erofs_dedupe_commit(true);
-		ret = -ENOSPC;
-		goto err_free_idata;
-	}
-	z_erofs_dedupe_commit(false);
-	z_erofs_write_mapheader(inode, compressmeta);
-
-	if (!ctx.fragemitted)
-		sbi->saved_by_deduplication += inode->fragment_size;
-
-	/* if the entire file is a fragment, a simplified form is used. */
-	if (inode->i_size <= inode->fragment_size) {
-		DBG_BUGON(inode->i_size < inode->fragment_size);
-		DBG_BUGON(inode->fragmentoff >> 63);
-		*(__le64 *)compressmeta =
-			cpu_to_le64(inode->fragmentoff | 1ULL << 63);
-		inode->datalayout = EROFS_INODE_COMPRESSED_FULL;
-		legacymetasize = Z_EROFS_LEGACY_MAP_HEADER_SIZE;
-	}
-
-	if (compressed_blocks) {
-		ret = erofs_bh_balloon(bh, erofs_pos(sbi, compressed_blocks));
-		DBG_BUGON(ret != erofs_blksiz(sbi));
-	} else {
-		if (!cfg.c_fragments && !cfg.c_dedupe)
-			DBG_BUGON(!inode->idata_size);
-	}
-
-	erofs_info("compressed %s (%llu bytes) into %u blocks",
-		   inode->i_srcpath, (unsigned long long)inode->i_size,
-		   compressed_blocks);
-
-	if (inode->idata_size) {
-		bh->op = &erofs_skip_write_bhops;
-		inode->bh_data = bh;
-	} else {
-		erofs_bdrop(bh, false);
-	}
-
-	inode->u.i_blocks = compressed_blocks;
-
-	if (inode->datalayout == EROFS_INODE_COMPRESSED_FULL) {
-		inode->extent_isize = legacymetasize;
-	} else {
-		ret = z_erofs_convert_to_compacted_format(inode, blkaddr,
-							  legacymetasize,
-							  compressmeta);
-		DBG_BUGON(ret);
-	}
-	inode->compressmeta = compressmeta;
-	if (!erofs_is_packed_inode(inode))
-		erofs_droid_blocklist_write(inode, blkaddr, compressed_blocks);
-	return 0;
+	return z_erofs_finalize_compression(&ctx, bh, blkaddr,
+					    compressed_blocks);
 
 err_free_idata:
 	if (inode->idata) {
@@ -1450,7 +1547,8 @@ err_free_idata:
 		inode->idata = NULL;
 	}
 err_bdrop:
-	erofs_bdrop(bh, true);	/* revoke buffer */
+	if (bh)
+		erofs_bdrop(bh, true);	/* revoke buffer */
 err_free_meta:
 	free(compressmeta);
 	inode->compressmeta = NULL;
@@ -1601,8 +1699,8 @@ int z_erofs_compress_init(struct erofs_sb_info *sbi, struct erofs_buffer_head *s
 	z_erofs_mt_enabled = false;
 #ifdef EROFS_MT_ENABLED
 	if (cfg.c_mt_workers > 1) {
-		pthread_mutex_init(&z_erofs_mt_ctrl.mutex, NULL);
-		pthread_cond_init(&z_erofs_mt_ctrl.cond, NULL);
+		pthread_mutex_init(&z_erofs_mt_ctrl.file_mutex, NULL);
+		pthread_mutex_init(&z_erofs_mt_ctrl.work_mutex, NULL);
 		ret = erofs_alloc_workqueue(&z_erofs_mt_ctrl.wq,
 					    cfg.c_mt_workers,
 					    cfg.c_mt_workers << 2,
@@ -1629,11 +1727,17 @@ int z_erofs_compress_exit(void)
 		ret = erofs_destroy_workqueue(&z_erofs_mt_ctrl.wq);
 		if (ret)
 			return ret;
-		while (z_erofs_mt_ctrl.idle) {
+		while (z_erofs_mt_ctrl.work_idle) {
 			struct erofs_compress_work *tmp =
-				z_erofs_mt_ctrl.idle->next;
-			free(z_erofs_mt_ctrl.idle);
-			z_erofs_mt_ctrl.idle = tmp;
+				z_erofs_mt_ctrl.work_idle->next;
+			free(z_erofs_mt_ctrl.work_idle);
+			z_erofs_mt_ctrl.work_idle = tmp;
+		}
+		while (z_erofs_mt_ctrl.file_idle) {
+			struct z_erofs_mt_file *tmp =
+				z_erofs_mt_ctrl.file_idle->next;
+			free(z_erofs_mt_ctrl.file_idle);
+			z_erofs_mt_ctrl.file_idle = tmp;
 		}
 #endif
 	}
