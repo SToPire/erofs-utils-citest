@@ -1487,6 +1487,7 @@ struct erofs_inode *erofs_mkfs_build_tree_from_path(const char *path)
 	if (!q)
 		return ERR_PTR(-ENOMEM);
 
+	q->size = EROFS_MT_QUEUE_SIZE;
 	q->queue = malloc(q->size * sizeof(*q->queue));
 	if (!q->queue) {
 		free(q);
@@ -1496,7 +1497,6 @@ struct erofs_inode *erofs_mkfs_build_tree_from_path(const char *path)
 	pthread_cond_init(&q->empty, NULL);
 	pthread_cond_init(&q->full, NULL);
 
-	q->size = EROFS_MT_QUEUE_SIZE;
 	q->head = 0;
 	q->tail = 0;
 	sbi.mkfs_dfops = q;
