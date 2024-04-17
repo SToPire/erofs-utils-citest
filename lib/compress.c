@@ -572,6 +572,7 @@ nocompression:
 		 */
 		e->compressedblks = 1;
 		e->raw = true;
+		e->inlined = false;
 	} else if (may_packing && len == e->length &&
 		   compressedsize < ctx->pclustersize &&
 		   (!inode->fragment_size || ictx->fix_dedupedfrag)) {
@@ -582,6 +583,7 @@ frag_packing:
 			return ret;
 		e->compressedblks = 0; /* indicate a fragment */
 		e->raw = false;
+		e->inlined = false;
 		ictx->fragemitted = true;
 	/* tailpcluster should be less than 1 block */
 	} else if (may_inline && len == e->length && compressedsize < blksz) {
@@ -600,6 +602,7 @@ frag_packing:
 			return ret;
 		e->compressedblks = 1;
 		e->raw = false;
+		e->inlined = true;
 	} else {
 		unsigned int tailused, padding;
 
@@ -652,6 +655,7 @@ frag_packing:
 				return ret;
 		}
 		e->raw = false;
+		e->inlined = false;
 		may_inline = false;
 		may_packing = false;
 	}
@@ -1151,6 +1155,9 @@ int z_erofs_merge_segment(struct z_erofs_compress_ictx *ictx,
 		ei->e.blkaddr = sctx->blkaddr;
 		sctx->blkaddr += ei->e.compressedblks;
 
+		if (ei->e.inlined)
+			continue;
+
 		ret2 = blk_write(sbi, sctx->membuf + blkoff * erofs_blksiz(sbi),
 				 ei->e.blkaddr, ei->e.compressedblks);
 		blkoff += ei->e.compressedblks;
@@ -1374,6 +1381,7 @@ int erofs_write_compressed_file(struct erofs_inode *inode, int fd, u64 fpos)
 			.compressedblks = 0,
 			.raw = false,
 			.partial = false,
+			.inlined = false,
 			.blkaddr = sctx.blkaddr,
 		};
 		init_list_head(&ei->list);
